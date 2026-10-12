@@ -1,7 +1,11 @@
+
 import subprocess
 from faster_whisper import WhisperModel
 
-print("Загружаю модель распознавания речи...")
+MICROPHONE = "plughw:2,0"
+AUDIO_FILE = "/tmp/wheatley_speech.wav"
+
+print("Загрузка модели распознавания...")
 
 model = WhisperModel(
     "tiny",
@@ -9,34 +13,47 @@ model = WhisperModel(
     compute_type="int8"
 )
 
-print("Wheatley готов! Говори в микрофон.")
+print("Wheatley готов!")
+print("Говори в микрофон. Для остановки нажми Ctrl+C.\n")
 
-while True:
-    try:
-        subprocess.run([
-            "arecord",
-            "-D", "plughw:2,0",
-            "-d", "5",
-            "-f", "S16_LE",
-            "-r", "16000",
-            "-c", "1",
-            "speech.wav"
-        ], check=True)
+try:
+    while True:
+        print("Слушаю 5 секунд...")
 
-        segments, info = model.transcribe(
-            "speech.wav",
-            language="ru"
+        subprocess.run(
+            [
+                "arecord",
+                "-D", MICROPHONE,
+                "-d", "5",
+                "-f", "S16_LE",
+                "-r", "16000",
+                "-c", "1",
+                "-t", "wav",
+                AUDIO_FILE
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL
         )
 
-        text = "".join(s.text for s in segments).strip()
+        segments, _ = model.transcribe(
+            AUDIO_FILE,
+            language="ru",
+            beam_size=1,
+            vad_filter=True
+        )
+
+        text = " ".join(
+            segment.text.strip()
+            for segment in segments
+        ).strip()
 
         if text:
-            print("Ты сказал:", text)
+            print(f"Ты сказал: {text}\n")
         else:
-            print("Речь не распознана.")
+            print("Речь не распознана.\n")
 
-    except KeyboardInterrupt:
-        print("\nWheatley выключается.")
-        break
-    except Exception as error:
-        print("Ошибка:", error)
+except KeyboardInterrupt:
+    print("\nWheatley остановлен.")
+
+except Exception as error:
+    print(f"Ошибка: {error}")
