@@ -1,576 +1,324 @@
+import json
 import math
+import queue
 import random
-import sys
+import subprocess
+import threading
 import time
+from urllib.request import Request, urlopen
 
 import pygame
+from faster_whisper import WhisperModel
+
+# Optional: use the project's existing voice.py if available.
+try:
+    from voice import WheatleyVoice
+    voice = WheatleyVoice()
+except Exception as error:
+    print(f"Voice module unavailable; text answers will still work: {error}")
+    voice = None
 
 
-pygame.init()
+# ---------- SETTINGS ----------
+MICROPHONE = "plughw:2,0"       # The working Raspberry Pi microphone
+AUDIO_FILE = "/tmp/wheatley_speech.wav"
+WHISPER_SIZE = "tiny"           # Lightweight for Raspberry Pi 5
+OLLAMA_MODEL = "qwen3:4b-instruct"
+OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+RECORD_SECONDS = 5
 
-WINDOW_SIZE = (1000, 700)
-screen = pygame.display.set_mode(WINDOW_SIZE)
-pygame.display.set_caption("Wheatley Eye")
+WIDTH, HEIGHT = 800, 480
+BG = (3, 5, 8)
+WHITE = (230, 245, 255)
+BLUE = (70, 170, 255)
+DARK_BLUE = (15, 55, 110)
+METAL = (135, 143, 150)
+DARK_METAL = (48, 54, 62)
 
-clock = pygame.time.Clock()
-fullscreen = False
-
-# Animation
-auto_gaze = True
-mode = "idle"
-
+messages = queue.Queue()
+busy = False
+status = "Ready — press M to speak"
+last_answer = ""
+gesture = "neutral"
+gesture_start = 0.0
 gaze_x = 0.0
 gaze_y = 0.0
 target_x = 0.0
 target_y = 0.0
-
-blink_amount = 0.0
-blink_state = 0
-next_gaze_time = 0.0
-next_blink_time = 0.0
+next_blink = time.monotonic() + random.uniform(2.5, 5.0)
+blink_until = 0.0
+whisper = None
 
 
-def now():
-    return time.monotonic()
+SYSTEM_PROMPT = """
+You are Wheatley, a friendly, enthusiastic, slightly nervous robot inspired
+by Portal 2. Reply naturally and briefly, usually in 1-3 sentences. Use the
+same language as the user. No stage directions or emojis.
+Return only JSON with this structure:
+{"answer":"spoken response","gesture":"yes"}
+gesture must be exactly "yes", "no", or "neutral".
+Use "yes" for an affirmative answer, "no" for a negative answer, and
+"neutral" for other questions.
+"""
 
 
-def toggle_fullscreen():
-    global screen, fullscreen
+def ask_qwen(question):
+    payload = {
+        "model": OLLAMA_MODEL,
+        "stream": False,
+        "format": "json",
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        "options": {"temperature": 0.7, "num_predict": 140},
+    }
+    request = Request(
+        OLLAMA_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=180) as response:
+        data = json.loads(response.read().decode("utf-8"))
 
-    fullscreen = not fullscreen
+    raw = data["message"]["content"]
+    try:
+        parsed = json.loads(raw)
+        answer = str(parsed.get("answer", raw)).strip()
+        move = str(parsed.get("gesture", "neutral")).lower()
+        if move not in ("yes", "no", "neutral"):
+            move = "neutral"
+        return answer or raw, move
+    except (json.JSONDecodeError, AttributeError):
+        return raw.strip(), "neutral"
 
-    if fullscreen:
-        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+
+def listen_and_reply():
+    global whisper
+
+    try:
+        messages.put(("status", "Loading speech model..."))
+        if whisper is None:
+            whisper = WhisperModel(
+                WHISPER_SIZE,
+                device="cpu",
+                compute_type="int8",
+            )
+
+        messages.put(("status", f"Listening for {RECORD_SECONDS} seconds..."))
+        subprocess.run(
+            [
+                "arecord", "-D", MICROPHONE,
+                "-d", str(RECORD_SECONDS),
+                "-f", "S16_LE",
+                "-r", "16000",
+                "-c", "1",
+                "-t", "wav",
+                AUDIO_FILE,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=RECORD_SECONDS + 10,
+        )
+
+        messages.put(("status", "Recognizing speech..."))
+        segments, _ = whisper.transcribe(
+            AUDIO_FILE,
+            language="ru",
+            beam_size=1,
+            vad_filter=True,
+        )
+        question = " ".join(s.text.strip() for s in segments).strip()
+        if not question:
+            messages.put(("status", "Didn't catch that — press M to retry"))
+            return
+
+        messages.put(("question", question))
+        messages.put(("status", "Wheatley is thinking..."))
+        answer, move = ask_qwen(question)
+        messages.put(("answer", answer, move))
+
+        if voice is not None:
+            try:
+                voice.speak(answer)
+            except Exception as error:
+                messages.put(("status", f"Voice error: {error}"))
+
+    except Exception as error:
+        messages.put(("error", str(error)))
+    finally:
+        messages.put(("finished",))
+
+
+def start_listening():
+    global busy, status
+    if busy:
+        return
+    busy = True
+    status = "Starting microphone..."
+    threading.Thread(target=listen_and_reply, daemon=True).start()
+
+
+def begin_gesture(move):
+    global gesture, gesture_start, status, target_x, target_y
+    gesture = move
+    gesture_start = time.monotonic()
+    if move == "yes":
+        status = "Wheatley says YES"
+    elif move == "no":
+        status = "Wheatley says NO"
     else:
-        screen = pygame.display.set_mode(WINDOW_SIZE)
+        status = "Wheatley answered"
 
 
-def choose_gaze():
-    global target_x, target_y, next_gaze_time
+def handle_messages():
+    global busy, status, last_answer
+    while True:
+        try:
+            msg = messages.get_nowait()
+        except queue.Empty:
+            break
 
-    target_x = random.uniform(-0.38, 0.38)
-    target_y = random.uniform(-0.22, 0.22)
-    next_gaze_time = now() + random.uniform(1.0, 3.0)
-
-
-def set_gaze(x, y):
-    global target_x, target_y
-
-    target_x = max(-0.45, min(0.45, float(x)))
-    target_y = max(-0.28, min(0.28, float(y)))
-
-
-def blink_now():
-    global blink_state
-
-    if blink_state == 0:
-        blink_state = 1
-
-
-def schedule_blink():
-    global next_blink_time
-    next_blink_time = now() + random.uniform(2.5, 5.5)
+        if msg[0] == "status":
+            status = msg[1]
+        elif msg[0] == "question":
+            print(f"You: {msg[1]}")
+        elif msg[0] == "answer":
+            last_answer = msg[1]
+            print(f"Wheatley: {last_answer}")
+            begin_gesture(msg[2])
+        elif msg[0] == "error":
+            status = f"Error: {msg[1]}"[:90]
+            print(status)
+        elif msg[0] == "finished":
+            busy = False
+            if status.startswith(("Listening", "Recognizing", "Wheatley is thinking")):
+                status = "Ready — press M to speak"
 
 
-def set_mode(new_mode):
-    global mode
-    mode = new_mode
+def draw_eye(surface, t):
+    global gesture, gaze_x, gaze_y, target_x, target_y, next_blink, blink_until
 
+    w, h = surface.get_size()
+    cx, cy = w // 2, h // 2 - 12
+    base = min(w, h)
+    outer = int(base * 0.34)
+    ring = int(base * 0.285)
+    black = int(base * 0.235)
+    lens = int(base * 0.17)
 
-def update_animation(dt):
-    global gaze_x, gaze_y
-    global blink_amount, blink_state
+    # Idle gaze drifts gently. YES and NO override it temporarily.
+    elapsed = t - gesture_start
+    if gesture == "yes" and elapsed < 1.35:
+        target_x = 0.0
+        target_y = math.sin(elapsed * math.pi * 3) * 0.24
+    elif gesture == "no" and elapsed < 1.35:
+        target_x = math.sin(elapsed * math.pi * 3) * 0.42
+        target_y = 0.0
+    else:
+        if gesture in ("yes", "no") and elapsed >= 1.35:
+            gesture = "neutral"
+        if random.random() < 0.008:
+            target_x = random.uniform(-0.25, 0.25)
+            target_y = random.uniform(-0.15, 0.15)
 
-    t = now()
-
-    if auto_gaze and t >= next_gaze_time:
-        choose_gaze()
-
-    # Плавное движение линзы
-    smooth = min(1.0, dt * 6.5)
-
+    smooth = 0.16
     gaze_x += (target_x - gaze_x) * smooth
     gaze_y += (target_y - gaze_y) * smooth
 
-    # Автоматическое моргание
-    if blink_state == 0 and t >= next_blink_time:
-        blink_state = 1
+    if t >= next_blink:
+        blink_until = t + 0.16
+        next_blink = t + random.uniform(2.5, 5.0)
 
-    if blink_state == 1:
-        blink_amount += dt * 8.5
+    pygame.draw.circle(surface, METAL, (cx, cy), outer)
+    pygame.draw.circle(surface, DARK_METAL, (cx, cy), int(outer * 0.88))
+    pygame.draw.circle(surface, (200, 207, 212), (cx, cy), ring, max(2, base // 150))
+    pygame.draw.circle(surface, (12, 15, 20), (cx, cy), black)
 
-        if blink_amount >= 1.0:
-            blink_amount = 1.0
-            blink_state = 2
-
-    elif blink_state == 2:
-        blink_amount -= dt * 9.5
-
-        if blink_amount <= 0.0:
-            blink_amount = 0.0
-            blink_state = 0
-            schedule_blink()
-
-
-def radial_line(
-    surface,
-    center,
-    angle,
-    radius1,
-    radius2,
-    color,
-    width=1,
-):
-    x1 = center[0] + math.cos(angle) * radius1
-    y1 = center[1] + math.sin(angle) * radius1
-
-    x2 = center[0] + math.cos(angle) * radius2
-    y2 = center[1] + math.sin(angle) * radius2
-
-    pygame.draw.line(
-        surface,
-        color,
-        (int(x1), int(y1)),
-        (int(x2), int(y2)),
-        width,
-    )
-
-
-def draw_glow(surface, center, radius):
-    # Мягкое голубое свечение вокруг линзы
-    glow = pygame.Surface(
-        (radius * 2 + 20, radius * 2 + 20),
-        pygame.SRCALPHA,
-    )
-
-    gx = radius + 10
-    gy = radius + 10
-
-    for i in range(14, 0, -1):
-        r = int(radius * i / 14)
-
-        alpha = int(
-            5 + (14 - i) * 2.2
-        )
-
-        pygame.draw.circle(
-            glow,
-            (30, 120, 255, alpha),
-            (gx, gy),
-            r,
-        )
-
-    surface.blit(
-        glow,
-        (center[0] - gx, center[1] - gy),
-    )
-
-
-def draw_eye(surface):
-    width, height = surface.get_size()
-
-    center_x = width // 2
-    center_y = height // 2
-
-    base = min(width, height)
-
-    # Размеры механического глаза
-    outer_radius = int(base * 0.33)
-    metal_radius = int(base * 0.285)
-    black_radius = int(base * 0.235)
-    lens_radius = int(base * 0.17)
-
-    # Тёмный фон
-    surface.fill((2, 3, 5))
-
-    # ==========================================
-    # МЕТАЛЛИЧЕСКИЙ КОРПУС
-    # ==========================================
-
-    pygame.draw.circle(
-        surface,
-        (170, 174, 178),
-        (center_x, center_y),
-        outer_radius,
-    )
-
-    pygame.draw.circle(
-        surface,
-        (105, 109, 114),
-        (center_x, center_y),
-        int(outer_radius * 0.91),
-    )
-
-    pygame.draw.circle(
-        surface,
-        (55, 59, 64),
-        (center_x, center_y),
-        int(outer_radius * 0.82),
-    )
-
-    # Металлическое кольцо
-
-    pygame.draw.circle(
-        surface,
-        (205, 208, 210),
-        (center_x, center_y),
-        metal_radius,
-        max(2, base // 150),
-    )
-
-    pygame.draw.circle(
-        surface,
-        (45, 48, 53),
-        (center_x, center_y),
-        int(metal_radius * 0.91),
-    )
-
-    # ==========================================
-    # РАДИАЛЬНЫЕ МЕХАНИЧЕСКИЕ ДЕТАЛИ
-    # ==========================================
-
+    # Three simple bolts and radial marks.
     for i in range(18):
-        angle = (
-            2 * math.pi * i / 18.0
-            + math.radians(4)
-        )
-
-        radial_line(
-            surface,
-            (center_x, center_y),
-            angle,
-            int(metal_radius * 0.80),
-            int(metal_radius * 0.95),
-            (75, 80, 85),
-            max(1, base // 280),
-        )
-
-    # ==========================================
-    # БОЛТЫ / КРЕПЛЕНИЯ
-    # ==========================================
+        a = 2 * math.pi * i / 18
+        p1 = (int(cx + math.cos(a) * ring * 0.78),
+              int(cy + math.sin(a) * ring * 0.78))
+        p2 = (int(cx + math.cos(a) * ring * 0.94),
+              int(cy + math.sin(a) * ring * 0.94))
+        pygame.draw.line(surface, (82, 90, 98), p1, p2, max(1, base // 280))
 
     for degrees in (30, 150, 270):
-        angle = math.radians(degrees)
+        a = math.radians(degrees)
+        bx = int(cx + math.cos(a) * ring * 0.78)
+        by = int(cy + math.sin(a) * ring * 0.78)
+        pygame.draw.circle(surface, (30, 34, 40), (bx, by), max(4, base // 90))
+        pygame.draw.circle(surface, (150, 157, 163), (bx, by), max(2, base // 125))
 
-        bolt_x = int(
-            center_x
-            + math.cos(angle)
-            * metal_radius
-            * 0.78
-        )
+    lx = int(cx + gaze_x * lens * 0.62)
+    ly = int(cy + gaze_y * lens * 0.62)
+    pygame.draw.circle(surface, DARK_BLUE, (lx, ly), int(lens * 1.08))
+    pygame.draw.circle(surface, (20, 90, 175), (lx, ly), lens)
+    pygame.draw.circle(surface, BLUE, (lx, ly), int(lens * 0.72))
+    pygame.draw.circle(surface, (150, 225, 255), (lx, ly), int(lens * 0.35))
+    pygame.draw.circle(surface, WHITE, (lx - int(lens * 0.22),
+                                       ly - int(lens * 0.25)),
+                       max(2, int(lens * 0.09)))
 
-        bolt_y = int(
-            center_y
-            + math.sin(angle)
-            * metal_radius
-            * 0.78
-        )
-
-        bolt_radius = max(
-            3,
-            int(base * 0.012),
-        )
-
-        pygame.draw.circle(
-            surface,
-            (38, 41, 45),
-            (bolt_x, bolt_y),
-            bolt_radius + 2,
-        )
-
-        pygame.draw.circle(
-            surface,
-            (120, 124, 127),
-            (bolt_x, bolt_y),
-            bolt_radius,
-        )
-
-    # ==========================================
-    # ЧЁРНАЯ ВНУТРЕННЯЯ КАМЕРА
-    # ==========================================
-
-    pygame.draw.circle(
-        surface,
-        (13, 15, 18),
-        (center_x, center_y),
-        black_radius,
-    )
-
-    pygame.draw.circle(
-        surface,
-        (3, 5, 8),
-        (center_x, center_y),
-        int(black_radius * 0.88),
-    )
-
-    # ==========================================
-    # ПОЛОЖЕНИЕ СВЕТОВОЙ ЛИНЗЫ
-    # ==========================================
-
-    lens_x = int(
-        center_x
-        + gaze_x * lens_radius * 0.62
-    )
-
-    lens_y = int(
-        center_y
-        + gaze_y * lens_radius * 0.62
-    )
-
-    lens_center = (
-        lens_x,
-        lens_y,
-    )
-
-    # ==========================================
-    # СВЕЧЕНИЕ
-    # ==========================================
-
-    draw_glow(
-        surface,
-        lens_center,
-        int(lens_radius * 1.35),
-    )
-
-    # ==========================================
-    # ВНЕШНИЙ СИНИЙ КОНТУР ЛИНЗЫ
-    # ==========================================
-
-    pygame.draw.circle(
-        surface,
-        (8, 34, 76),
-        lens_center,
-        lens_radius + int(base * 0.015),
-    )
-
-    pygame.draw.circle(
-        surface,
-        (17, 70, 145),
-        lens_center,
-        int(lens_radius * 0.92),
-    )
-
-    # ==========================================
-    # РАДИАЛЬНЫЕ ЛИНИИ ВНУТРИ ЛИНЗЫ
-    # ==========================================
-
-    for i in range(24):
-
-        angle = (
-            2 * math.pi * i / 24.0
-        )
-
-        radial_line(
-            surface,
-            lens_center,
-            angle,
-            int(lens_radius * 0.25),
-            int(lens_radius * 0.88),
-            (30, 120, 220),
-            max(1, base // 260),
-        )
-
-    # ==========================================
-    # СВЕТЯЩАЯСЯ ЦЕНТРАЛЬНАЯ ЧАСТЬ
-    # ==========================================
-
-    pygame.draw.circle(
-        surface,
-        (50, 155, 255),
-        lens_center,
-        int(lens_radius * 0.70),
-    )
-
-    pygame.draw.circle(
-        surface,
-        (75, 190, 255),
-        lens_center,
-        int(lens_radius * 0.48),
-    )
-
-    # Центр
-    center_radius = int(
-        lens_radius * 0.24
-    )
-
-    if mode == "surprised":
-        center_radius = int(
-            center_radius * 1.18
-        )
-
-    elif mode == "thinking":
-        center_radius = int(
-            center_radius * 0.90
-        )
-
-    pygame.draw.circle(
-        surface,
-        (175, 235, 255),
-        lens_center,
-        center_radius,
-    )
-
-    pygame.draw.circle(
-        surface,
-        (230, 250, 255),
-        lens_center,
-        max(
-            2,
-            int(center_radius * 0.62),
-        ),
-    )
-
-    # ==========================================
-    # БЛИК
-    # ==========================================
-
-    highlight_x = (
-        lens_x
-        - int(lens_radius * 0.24)
-    )
-
-    highlight_y = (
-        lens_y
-        - int(lens_radius * 0.28)
-    )
-
-    pygame.draw.circle(
-        surface,
-        (245, 255, 255),
-        (
-            highlight_x,
-            highlight_y,
-        ),
-        max(
-            2,
-            int(lens_radius * 0.10),
-        ),
-    )
-
-    # ==========================================
-    # МЕХАНИЧЕСКИЕ ВЕКИ
-    # ==========================================
-
-    if blink_amount > 0.0:
-
-        lid_height = int(
-            base * 0.23
-            * blink_amount
-        )
-
-        # Верхняя створка
-
-        pygame.draw.rect(
-            surface,
-            (7, 9, 12),
-            (
-                center_x - outer_radius,
-                center_y - outer_radius,
-                outer_radius * 2,
-                lid_height,
-            ),
-        )
-
-        # Нижняя створка
-
-        pygame.draw.rect(
-            surface,
-            (7, 9, 12),
-            (
-                center_x - outer_radius,
-                center_y + outer_radius - lid_height,
-                outer_radius * 2,
-                lid_height,
-            ),
-        )
+    if t < blink_until:
+        lid_h = int(base * 0.23)
+        pygame.draw.rect(surface, BG, (cx - outer, cy - outer, outer * 2, lid_h))
+        pygame.draw.rect(surface, BG, (cx - outer, cy + outer - lid_h, outer * 2, lid_h))
 
 
-choose_gaze()
-schedule_blink()
+def main():
+    global status
 
-running = True
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+    pygame.display.set_caption("Wheatley")
+    clock = pygame.time.Clock()
+    font = pygame.font.Font(None, 25)
+    small_font = pygame.font.Font(None, 20)
+    fullscreen = False
+    running = True
 
-while running:
+    print("Wheatley ready. Press M to ask a question; ESC to quit.")
 
-    dt = (
-        clock.tick(60)
-        / 1000.0
-    )
-
-    for event in pygame.event.get():
-
-        if event.type == pygame.QUIT:
-
-            running = False
-
-        elif event.type == pygame.KEYDOWN:
-
-            if event.key == pygame.K_ESCAPE:
-
+    while running:
+        t = time.monotonic()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_m:
+                    start_listening()
+                elif event.key == pygame.K_SPACE:
+                    global blink_until
+                    blink_until = t + 0.16
+                elif event.key == pygame.K_F11:
+                    fullscreen = not fullscreen
+                    screen = pygame.display.set_mode(
+                        (0, 0) if fullscreen else (WIDTH, HEIGHT),
+                        pygame.FULLSCREEN if fullscreen else pygame.RESIZABLE,
+                    )
 
-            elif event.key == pygame.K_F11:
+        handle_messages()
+        screen.fill(BG)
+        draw_eye(screen, t)
 
-                toggle_fullscreen()
+        status_text = small_font.render(status[:95], True, (190, 220, 240))
+        screen.blit(status_text, (12, screen.get_height() - 27))
 
-            elif event.key == pygame.K_SPACE:
+        hint = font.render("M: Speak   SPACE: Blink   ESC: Quit", True, (125, 155, 180))
+        screen.blit(hint, (12, 10))
 
-                blink_now()
+        pygame.display.flip()
+        clock.tick(60)
 
-            elif event.key == pygame.K_a:
-
-                auto_gaze = not auto_gaze
-
-            elif event.key == pygame.K_LEFT:
-
-                set_gaze(
-                    -0.45,
-                    target_y,
-                )
-
-            elif event.key == pygame.K_RIGHT:
-
-                set_gaze(
-                    0.45,
-                    target_y,
-                )
-
-            elif event.key == pygame.K_UP:
-
-                set_gaze(
-                    target_x,
-                    -0.28,
-                )
-
-            elif event.key == pygame.K_DOWN:
-
-                set_gaze(
-                    target_x,
-                    0.28,
-                )
-
-            elif event.key == pygame.K_1:
-
-                set_mode("idle")
-
-            elif event.key == pygame.K_2:
-
-                set_mode("talking")
-
-            elif event.key == pygame.K_3:
-
-                set_mode("thinking")
-
-            elif event.key == pygame.K_4:
-
-                set_mode("surprised")
-
-    update_animation(dt)
-
-    draw_eye(screen)
-
-    pygame.display.flip()
+    pygame.quit()
 
 
-pygame.quit()
-sys.exit()
+if __name__ == "__main__":
+    main()
