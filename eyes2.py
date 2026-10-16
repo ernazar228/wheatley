@@ -26,6 +26,7 @@ WHISPER_SIZE = "tiny"           # Lightweight for Raspberry Pi 5
 OLLAMA_MODEL = "qwen3:4b-instruct"
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 RECORD_SECONDS = 5
+GESTURE_DURATION = 1.8       # Make YES/NO movements easier to notice
 
 WIDTH, HEIGHT = 800, 480
 BG = (3, 5, 8)
@@ -212,20 +213,24 @@ def draw_eye(surface, t):
 
     # Idle gaze drifts gently. YES and NO override it temporarily.
     elapsed = t - gesture_start
-    if gesture == "yes" and elapsed < 1.35:
+    if gesture == "yes" and elapsed < GESTURE_DURATION:
+        # Two large, clear vertical nods, then return to the center.
         target_x = 0.0
-        target_y = math.sin(elapsed * math.pi * 3) * 0.24
-    elif gesture == "no" and elapsed < 1.35:
-        target_x = math.sin(elapsed * math.pi * 3) * 0.42
+        target_y = math.sin(elapsed * math.tau * 2 / GESTURE_DURATION) * 0.78
+    elif gesture == "no" and elapsed < GESTURE_DURATION:
+        # Two clear side-to-side shakes, with a larger range of motion.
+        target_x = math.sin(elapsed * math.tau * 2 / GESTURE_DURATION) * 0.78
         target_y = 0.0
     else:
-        if gesture in ("yes", "no") and elapsed >= 1.35:
+        if gesture in ("yes", "no") and elapsed >= GESTURE_DURATION:
             gesture = "neutral"
+            target_x = 0.0
+            target_y = 0.0
         if random.random() < 0.008:
             target_x = random.uniform(-0.25, 0.25)
             target_y = random.uniform(-0.15, 0.15)
 
-    smooth = 0.16
+    smooth = 0.22
     gaze_x += (target_x - gaze_x) * smooth
     gaze_y += (target_y - gaze_y) * smooth
 
